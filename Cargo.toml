@@ -1,0 +1,28 @@
+[package]
+name = "plonky3-ccs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+p3-air = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+ark-bn254 = "0.4.0"
+ark-ff = "0.4.1"
+ark-poly = "0.4.1"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+num-bigint = "0.4"
+folding-schemes = { git = "https://github.com/dmpierre/sonobe" }
+ark-std = "0.4.0"
+thiserror = "1.0.39"
+
+[dev-dependencies]
+p3-keccak-air = { git = "https://github.com/Plonky3/Plonky3", rev = "7b5b8a6" }
+rand = "0.8.5"
+
+[patch.crates-io]
+ark-r1cs-std = { git = "https://github.com/winderica/r1cs-std", branch="cherry-pick" }
+ark-bn254 = { git = "https://github.com/arnaucube/ark-curves-cherry-picked", branch="cherry-pick"}
+ark-grumpkin = { git = "https://github.com/arnaucube/ark-curves-cherry-picked", branch="cherry-pick"}
