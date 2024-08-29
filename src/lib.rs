@@ -57,6 +57,44 @@ pub fn extract_public_values<F: Field>(
     Some(((cell_column, cell_location), public))
 }
 
+/// Constants against which a public input is asserted equal
+/// For instance constraints of the type: when_first_row.assert_zero(x);
+/// where `x` is a user provided public input
+pub fn extract_public_constants<F: Field>(
+    e: &SymbolicExpression<F>,
+) -> Option<((usize, Location), F)> {
+    use SymbolicExpression as SE;
+    use SymbolicVariable as SV;
+    let (mul_lhs, mul_rhs) = match e {
+        SE::Mul(lhs, rhs) => (&**lhs, &**rhs),
+        _ => return None,
+    };
+
+    let (cell_location, (sub_lhs, sub_rhs)) = match (mul_lhs, mul_rhs) {
+        (SE::Location(location @ (Location::FirstRow | Location::LastRow)), SE::Sub(lhs, rhs)) => {
+            (*location, (&**lhs, &**rhs))
+        }
+        // The match arm for the zero constant is done differently
+        // plonky3 expresses an assert equal against the zero constant using a different polynomial
+        // expression.
+        (
+            SE::Location(location @ (Location::FirstRow | Location::LastRow)),
+            SE::Variable(SV(Var::Public(p), _)),
+        ) => return Some(((p.index, *location), F::zero())),
+        _ => return None,
+    };
+
+    match (sub_lhs, sub_rhs) {
+        (SE::Variable(SV(Var::Public(p), _)), SE::Constant(c)) => {
+            return Some(((p.index, cell_location), *c))
+        }
+        _ => return None,
+    };
+}
+
+/// Constants against which a cell expression is asserted equal
+/// For instance constraints of the type: when_first_row.assert_zero(local.right);
+/// TODO: merge with `extract_public_constants`
 pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize, Location), F)> {
     use SymbolicExpression as SE;
     use SymbolicVariable as SV;
@@ -65,19 +103,21 @@ pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize,
         _ => return None,
     };
 
-    // 
     let (cell_location, (sub_lhs, sub_rhs)) = match (mul_lhs, mul_rhs) {
         (SE::Location(location @ (Location::FirstRow | Location::LastRow)), SE::Sub(lhs, rhs)) => {
             (*location, (&**lhs, &**rhs))
         }
         // match arm handling the assert_zero() constant constraint
-        (SE::Location(location @ (Location::FirstRow | Location::LastRow)), SE::Variable(SV(
+        (
+            SE::Location(location @ (Location::FirstRow | Location::LastRow)),
+            SE::Variable(SV(
                 Var::Query(Query {
                     is_next: false,
                     column,
                 }),
                 _,
-            ))) => return Some(((*column, *location), F::zero())), 
+            )),
+        ) => return Some(((*column, *location), F::zero())),
         _ => return None,
     };
     let (cell_column, constant) = match (sub_lhs, sub_rhs) {
@@ -201,12 +241,12 @@ pub fn build_polynomials_from_constraints<F: Field, AF: PrimeField>(
 /// `transition_polynomials` are used to check the correctness of rows AIR transitions, `boundary_polynomials`
 /// are used to check the correctness of public input values.
 /// `constant_polynomials` are similar to `boundary_polynomials` since they define constants
-/// against which trace values should be equal to. 
+/// against which trace values should be equal to.
 /// TODO: merge together constant and boundary polynomials
 pub struct AirPolynomials<F: PrimeField> {
     pub transition_polynomials: Vec<SparsePolynomial<F, SparseTerm>>,
-    pub boundary_polynomials: HashMap<usize, F>,
-    pub constant_polynomials: HashMap<usize, F>
+    pub boundary_polynomials: HashMap<usize, (F, Location)>,
+    pub constant_polynomials: HashMap<usize, F>,
 }
 
 /// Given a set of AIR constraints, returns an `AirPolynomials` struct, containing both transition
@@ -224,24 +264,20 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
     let mut boundary_polynomials = HashMap::new();
     let mut constant_polynomials = HashMap::new();
     let mut transition_polynomials = vec![];
+
     for constraint in constraints {
-        if let Some(((cell_col, cell_loc), public)) = extract_public_values(constraint) {
+        if let Some(((cell_col, cell_loc), constant)) = extract_public_constants(constraint) {
             match cell_loc {
                 Location::FirstRow => {
                     let trace_pos = cell_col;
-                    let value = trace.values[trace_pos];
-                    boundary_polynomials.insert(trace_pos, value.0);
+                    constant_polynomials.insert(trace_pos, constant.0);
                 }
                 Location::LastRow => {
                     let trace_pos = n_cols * (n - 1) + cell_col;
-                    let value = trace.values[trace_pos];
-                    boundary_polynomials.insert(trace_pos, value.0);
+                    constant_polynomials.insert(trace_pos, constant.0);
                 }
                 Location::Transition => {
-                    panic!(
-                            "[NOT SUPPORTED] Found a public value in a transition constraint, cell_loc: {}, cell_col: {}, public: {}",
-                            cell_loc, cell_loc, public
-                        );
+                    panic!("Not supported yet");
                 }
             };
             continue;
@@ -258,9 +294,28 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
                     constant_polynomials.insert(trace_pos, constant.0);
                 }
                 Location::Transition => {
+                    panic!("Not supported yet");
+                }
+            };
+            continue;
+        }
+
+        if let Some(((cell_col, cell_loc), public)) = extract_public_values(constraint) {
+            match cell_loc {
+                Location::FirstRow => {
+                    let trace_pos = cell_col;
+                    let value = trace.values[trace_pos];
+                    boundary_polynomials.insert(trace_pos, (value.0, Location::FirstRow));
+                }
+                Location::LastRow => {
+                    let trace_pos = n_cols * (n - 1) + cell_col;
+                    let value = trace.values[trace_pos];
+                    boundary_polynomials.insert(trace_pos, (value.0, Location::LastRow));
+                }
+                Location::Transition => {
                     panic!(
-                            "[NOT SUPPORTED] Found a constant in a transition constraint, cell_loc: {}, cell_col: {}, constant: {}",
-                            cell_loc, cell_loc, constant 
+                            "[NOT SUPPORTED] Found a public value in a transition constraint, cell_loc: {}, cell_col: {}, public: {}",
+                            cell_loc, cell_loc, public
                         );
                 }
             };
@@ -274,28 +329,46 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
     AirPolynomials {
         transition_polynomials,
         boundary_polynomials,
-        constant_polynomials
+        constant_polynomials,
     }
+}
+
+/// `trace_idx_to_z_idx` maps a position in the trace to a position in the `z` vector.
+pub struct ZCCS<F: PrimeField> {
+    pub z: Vec<F>,
+    pub trace_idx_to_z_idx: HashMap<usize, usize>,
 }
 
 /// Builds the `z` vector which will satisfy a CCS
 pub fn air_trace_to_z<F: PrimeField>(
     trace: &RowMajorMatrix<ArkField<F>>,
-    boundary_polynomials: &HashMap<usize, F>,
-) -> Vec<F> {
+    polynomials: &AirPolynomials<F>,
+) -> ZCCS<F> {
     let mut z = vec![];
     let mut pubs = vec![];
 
+    // we keep a record of where in z wtns values are located
+    let len_wtns_values = trace.values.len() - polynomials.boundary_polynomials.len();
+    let mut trace_idx_to_z_idx = HashMap::new();
+    let mut cur_z_wtns_idx = 0;
+    let mut cur_z_pub_idx = len_wtns_values;
     for (trace_pos, value) in trace.values.iter().enumerate() {
-        if boundary_polynomials.contains_key(&trace_pos) {
+        if polynomials.boundary_polynomials.contains_key(&trace_pos) {
             pubs.push(value.0);
+            trace_idx_to_z_idx.insert(trace_pos, cur_z_pub_idx);
+            cur_z_pub_idx += 1;
         } else {
             z.push(value.0);
+            trace_idx_to_z_idx.insert(trace_pos, cur_z_wtns_idx);
+            cur_z_wtns_idx += 1;
         }
     }
     z.extend(pubs);
     z.push(F::one());
-    z
+    ZCCS {
+        z,
+        trace_idx_to_z_idx,
+    }
 }
 
 /// This is used to turn several air polynomials into a single one.
@@ -303,19 +376,22 @@ pub fn air_trace_to_z<F: PrimeField>(
 /// https://eprint.iacr.org/2023/552.pdf, p. 7
 pub fn air_transition_polynomials_to_unique_polynomial<F: PrimeField>(
     r: &F,
-    transition_polynomials: &Vec<SparsePolynomial<F, SparseTerm>>,
+    polynomials: &AirPolynomials<F>,
 ) -> SparsePolynomial<F, SparseTerm> {
-    let n_variables = transition_polynomials[0].num_vars;
+    let n_variables = polynomials.transition_polynomials[0].num_vars;
     let mut mul = F::one();
     let zero_poly = SparsePolynomial::from_coefficients_vec(n_variables, vec![]);
-    transition_polynomials.iter().fold(zero_poly, |acc, poly| {
-        let r_factor = SparsePolynomial::from_coefficients_vec(
-            n_variables,
-            vec![(mul, SparseTerm::new(vec![]))],
-        );
-        mul *= r;
-        acc + naive_arkpoly_mul(&r_factor, &poly)
-    })
+    polynomials
+        .transition_polynomials
+        .iter()
+        .fold(zero_poly, |acc, poly| {
+            let r_factor = SparsePolynomial::from_coefficients_vec(
+                n_variables,
+                vec![(mul, SparseTerm::new(vec![]))],
+            );
+            mul *= r;
+            acc + naive_arkpoly_mul(&r_factor, &poly)
+        })
 }
 
 #[derive(Debug)]
@@ -335,7 +411,6 @@ pub enum AirToCCSError {
 
 pub fn derive_ccs_constants<F: PrimeField>(
     trace: &RowMajorMatrix<ArkField<F>>,
-    n_cols: usize,
     air_final_poly: &SparsePolynomial<F, SparseTerm>,
 ) -> Result<AirCCSConstants, AirToCCSError> {
     let (m, t, d, q) = (
@@ -358,20 +433,20 @@ pub struct AirCCSMatrices<F: PrimeField> {
 }
 
 /// Builds the CCS matrices out of both boundary and transition constraints
+/// TODO: remove all `unwrap()` calls appearing below
 pub fn build_ccs_matrices<F: PrimeField>(
     ccs_constants: &AirCCSConstants,
     air_polynomials: &AirPolynomials<F>,
-    num_public_values: usize,
-    z: &Vec<F>,
-    n_cols: usize,
+    z: &ZCCS<F>,
 ) -> AirCCSMatrices<F> {
     let n_boundary_constraints = air_polynomials.boundary_polynomials.keys().len();
     let n_constants_constraints = air_polynomials.constant_polynomials.keys().len();
-    let  n_boundary_and_constants_constraints_rows= (n_boundary_constraints + n_constants_constraints).div_ceil(ccs_constants.t);
+    let n_boundary_and_constants_constraints_rows =
+        (n_boundary_constraints + n_constants_constraints).div_ceil(ccs_constants.t);
     let mut matrices: Vec<SparseMatrix<F>> = vec![];
     for _ in 0..ccs_constants.t {
         let mut coeffs = vec![];
-        for _ in 0..ccs_constants.m +  n_boundary_and_constants_constraints_rows{
+        for _ in 0..ccs_constants.m + n_boundary_and_constants_constraints_rows {
             coeffs.push(vec![]);
         }
         matrices.push(SparseMatrix {
@@ -381,61 +456,38 @@ pub fn build_ccs_matrices<F: PrimeField>(
         })
     }
 
+    // This is the first modification to lemma 3. Consists into adding boundary constraints.
+    // Assumes that there is a single boundary constraint per idx
+    // Assumes that boundary constraints are not applied to intermediary witness values
+    for (i, (trace_idx, (value, location))) in
+        air_polynomials.boundary_polynomials.iter().enumerate()
+    {
+        let z_idx = z.trace_idx_to_z_idx.get(&trace_idx).unwrap();
+        let matrix_idx = i % ccs_constants.t;
+        let row_idx = ccs_constants.m + i / ccs_constants.t;
+        matrices[matrix_idx].coeffs[row_idx].push((F::one(), *z_idx));
+        matrices[matrix_idx].coeffs[row_idx].push((-*value, z.z.len() - 1));
+    }
+
     // This is the algorithm described in lemma 3, with a few modifications
-    // We modify the calculation of k_j and handle the case of an air trace with no public inputs
-    let len_w_air = ccs_constants.n - num_public_values - 1;
     #[allow(non_snake_case)]
     let mut N = 0;
     for i in 0..ccs_constants.m {
         for j in 0..ccs_constants.t {
-            if i == 0 && j < ccs_constants.t / 2 {
-                if num_public_values > 0 {
-                    matrices[j].coeffs[i].push((F::one(), j + len_w_air));
-                } else {
-                    matrices[j].coeffs[i].push((F::one(), i * ccs_constants.t / 2 + j));
-                }
-            } else if i == ccs_constants.m - 1 && j >= ccs_constants.t / 2 {
-                if num_public_values > 0 {
-                    matrices[j].coeffs[i].push((F::one(), j + len_w_air));
-                } else {
-                    matrices[j].coeffs[i].push((F::one(), i * ccs_constants.t / 2 + j));
-                }
-            } else {
-                if num_public_values > 0 {
-                    let k_j = ((ccs_constants.t as i128) * ((i as i128) - 1) / 2) + (j as i128);
-                    matrices[j].coeffs[i].push((F::one(), k_j as usize));
-                } else {
-                    matrices[j].coeffs[i].push((F::one(), i * ccs_constants.t / 2 + j));
-                }
-            }
+            let trace_idx = i * ccs_constants.t / 2 + j;
+            let z_idx = z.trace_idx_to_z_idx.get(&trace_idx).unwrap();
+            matrices[j].coeffs[i].push((F::one(), *z_idx));
             N += 1
         }
     }
 
-    // Add boundary constraints
-    // Assumes that there is a single boundary constraint per idx
-    // Assumes that boundary constraints are not applied to intermediary witness values
-    for (i, (trace_idx, value)) in air_polynomials.boundary_polynomials.iter().enumerate() {
-        let z_idx = if trace_idx < &n_cols {
-            // converts trace idx to idx in z
-            // vector
-            *trace_idx + len_w_air
-        } else {
-            *trace_idx
-        };
-        let matrix_idx = i % ccs_constants.t;
-        let row_idx = ccs_constants.m + i / ccs_constants.t;
-        matrices[matrix_idx].coeffs[row_idx].push((F::one(), z_idx));
-        matrices[matrix_idx].coeffs[row_idx].push((-*value, z.len() - 1));
-    }
-
     // Add constant constraints
     for (i, (trace_idx, value)) in air_polynomials.constant_polynomials.iter().enumerate() {
-        let z_idx = *trace_idx;
+        let z_idx = z.trace_idx_to_z_idx.get(trace_idx).unwrap();
         let matrix_idx = i % ccs_constants.t;
         let row_idx = ccs_constants.m + i / ccs_constants.t;
-        matrices[matrix_idx].coeffs[row_idx].push((F::one(), z_idx));
-        matrices[matrix_idx].coeffs[row_idx].push((-*value, z.len() - 1));
+        matrices[matrix_idx].coeffs[row_idx].push((F::one(), *z_idx));
+        matrices[matrix_idx].coeffs[row_idx].push((-*value, z.z.len() - 1));
     }
 
     AirCCSMatrices {
