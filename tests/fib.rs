@@ -139,13 +139,15 @@ pub mod tests {
         let trace = generate_trace_rows::<ArkField<Fr>>(1, 1, n);
         let builder = compile_circuit_cs::<Fr, _>(&mut air, num_public_values);
         let air_polynomials =
-            air_constraints_to_air_polynomials(&builder.constraints, &trace, n, NUM_FIBONACCI_COLS);
+            air_constraints_to_air_polynomials(&builder.constraints, &trace, n, NUM_FIBONACCI_COLS)
+                .unwrap();
         let z_ccs = air_trace_to_z(&trace, &air_polynomials);
 
         let r = Fr::rand(&mut rng);
         let final_poly = air_transition_polynomials_to_unique_polynomial(&r, &air_polynomials);
         let ccs_constants = derive_ccs_constants(&trace, &final_poly).unwrap();
-        let air_ccs_matrices = build_ccs_matrices(&ccs_constants, &air_polynomials, &z_ccs);
+        let air_ccs_matrices =
+            build_ccs_matrices(&ccs_constants, &air_polynomials, &z_ccs).unwrap();
         let (multisets, c_coeffs) = build_multisets_and_c_coefficients(&ccs_constants, &final_poly);
 
         let ccs = CCS {

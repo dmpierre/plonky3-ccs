@@ -13,7 +13,6 @@ use ark_poly::{
     DenseMVPolynomial,
 };
 use arkfield::ArkField;
-use core::panic;
 use folding_schemes::utils::vec::SparseMatrix;
 use p3_air::Air;
 use p3_field::{Field, PrimeField as p3PrimeField};
@@ -57,44 +56,8 @@ pub fn extract_public_values<F: Field>(
     Some(((cell_column, cell_location), public))
 }
 
-/// Constants against which a public input is asserted equal
-/// For instance constraints of the type: when_first_row.assert_zero(x);
-/// where `x` is a user provided public input
-pub fn extract_public_constants<F: Field>(
-    e: &SymbolicExpression<F>,
-) -> Option<((usize, Location), F)> {
-    use SymbolicExpression as SE;
-    use SymbolicVariable as SV;
-    let (mul_lhs, mul_rhs) = match e {
-        SE::Mul(lhs, rhs) => (&**lhs, &**rhs),
-        _ => return None,
-    };
-
-    let (cell_location, (sub_lhs, sub_rhs)) = match (mul_lhs, mul_rhs) {
-        (SE::Location(location @ (Location::FirstRow | Location::LastRow)), SE::Sub(lhs, rhs)) => {
-            (*location, (&**lhs, &**rhs))
-        }
-        // The match arm for the zero constant is done differently
-        // plonky3 expresses an assert equal against the zero constant using a different polynomial
-        // expression.
-        (
-            SE::Location(location @ (Location::FirstRow | Location::LastRow)),
-            SE::Variable(SV(Var::Public(p), _)),
-        ) => return Some(((p.index, *location), F::zero())),
-        _ => return None,
-    };
-
-    match (sub_lhs, sub_rhs) {
-        (SE::Variable(SV(Var::Public(p), _)), SE::Constant(c)) => {
-            return Some(((p.index, cell_location), *c))
-        }
-        _ => return None,
-    };
-}
-
 /// Constants against which a cell expression is asserted equal
 /// For instance constraints of the type: when_first_row.assert_zero(local.right);
-/// TODO: merge with `extract_public_constants`
 pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize, Location), F)> {
     use SymbolicExpression as SE;
     use SymbolicVariable as SV;
@@ -107,7 +70,8 @@ pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize,
         (SE::Location(location @ (Location::FirstRow | Location::LastRow)), SE::Sub(lhs, rhs)) => {
             (*location, (&**lhs, &**rhs))
         }
-        // match arm handling the assert_zero() constant constraint
+        // This match arm handles the assert_zero() constant constraint
+        // In this case, the constant is not public
         (
             SE::Location(location @ (Location::FirstRow | Location::LastRow)),
             SE::Variable(SV(
@@ -118,6 +82,12 @@ pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize,
                 _,
             )),
         ) => return Some(((*column, *location), F::zero())),
+        // This match arm handles the assert_zero() constant constraint
+        // In this case, the constant is public
+        (
+            SE::Location(location @ (Location::FirstRow | Location::LastRow)),
+            SE::Variable(SV(Var::Public(p), _)),
+        ) => return Some(((p.index, *location), F::zero())),
         _ => return None,
     };
     let (cell_column, constant) = match (sub_lhs, sub_rhs) {
@@ -131,6 +101,10 @@ pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize,
             )),
             SE::Constant(value),
         ) => (*column, *value),
+        // This match arms handles public constants of any value, different from zero
+        (SE::Variable(SV(Var::Public(p), _)), SE::Constant(c)) => {
+            return Some(((p.index, cell_location), *c))
+        }
         _ => return None,
     };
     Some(((cell_column, cell_location), constant))
@@ -154,7 +128,7 @@ where
 fn sym_variable_to_sparse_poly<F: PrimeField>(
     variable: &SymbolicVariable<ArkField<F>>,
     n_variables: usize,
-) -> SparsePolynomial<F, SparseTerm> {
+) -> Result<SparsePolynomial<F, SparseTerm>, AirToCCSError> {
     let n_cols = n_variables / 2;
     match variable.0 {
         Var::Query(query) => {
@@ -163,12 +137,11 @@ fn sym_variable_to_sparse_poly<F: PrimeField>(
                 n_variables,
                 vec![(F::one(), SparseTerm::new(vec![(var, 1)]))],
             );
-            debug_assert!(poly.num_vars() == n_variables);
-            return poly;
+            Ok(poly)
         }
-        Var::Public(_) => {
-            panic!("Public variables are not supported here!")
-        }
+        Var::Public(_) => Err(AirToCCSError::NotSupported(
+            "Public variables are not supported yet!".to_string(),
+        )),
     }
 }
 
@@ -194,51 +167,50 @@ fn sym_constant_to_sparse_poly<F: p3PrimeField, AF: PrimeField>(
 fn expr_to_polynomial<F: PrimeField + Hash>(
     e: &SymbolicExpression<ArkField<F>>,
     n_variables_in_polynomial: usize,
-) -> SparsePolynomial<F, SparseTerm> {
+) -> Result<SparsePolynomial<F, SparseTerm>, AirToCCSError> {
     use SymbolicExpression as SE;
     // Number of variables in the polynomial that we will build from the provided constraint
     match e {
         SE::Variable(var) => sym_variable_to_sparse_poly(var, n_variables_in_polynomial),
-        SE::Neg(e) => -expr_to_polynomial(e, n_variables_in_polynomial),
-        SE::Sub(lhs, rhs) => {
-            &expr_to_polynomial(lhs, n_variables_in_polynomial)
-                - &expr_to_polynomial(rhs, n_variables_in_polynomial)
-        }
+        SE::Neg(e) => Ok(-expr_to_polynomial(e, n_variables_in_polynomial)?),
+        SE::Sub(lhs, rhs) => Ok(&expr_to_polynomial(lhs, n_variables_in_polynomial)?
+            - &expr_to_polynomial(rhs, n_variables_in_polynomial)?),
         SE::Location(_) => {
             // assuming that location is always multiplying some other polynomial
             // e.g. air constraint is of the form: Mul(Location(FirstRow), Sub(Variable(...)))
-            sym_constant_to_sparse_poly(&ArkField(F::one()), n_variables_in_polynomial)
+            Ok(sym_constant_to_sparse_poly(
+                &ArkField(F::one()),
+                n_variables_in_polynomial,
+            ))
         }
-        SE::Constant(val) => sym_constant_to_sparse_poly(val, n_variables_in_polynomial),
-        SE::Add(lhs, rhs) => {
-            &expr_to_polynomial(lhs, n_variables_in_polynomial)
-                + &expr_to_polynomial(rhs, n_variables_in_polynomial)
-        }
-        SE::Mul(lhs, rhs) => naive_arkpoly_mul(
-            &expr_to_polynomial(lhs, n_variables_in_polynomial),
-            &expr_to_polynomial(rhs, n_variables_in_polynomial),
-        ),
+        SE::Constant(val) => Ok(sym_constant_to_sparse_poly(val, n_variables_in_polynomial)),
+        SE::Add(lhs, rhs) => Ok(&expr_to_polynomial(lhs, n_variables_in_polynomial)?
+            + &expr_to_polynomial(rhs, n_variables_in_polynomial)?),
+        SE::Mul(lhs, rhs) => Ok(naive_arkpoly_mul(
+            &expr_to_polynomial(lhs, n_variables_in_polynomial)?,
+            &expr_to_polynomial(rhs, n_variables_in_polynomial)?,
+        )),
     }
 }
 
-// Build polynomials from the transition constraints, expressed as symbolic expressions in plonky3
-// air circuits
+/// Build polynomials from the transition constraints, expressed as symbolic expressions in plonky3
+/// air circuits
 pub fn build_polynomials_from_constraints<F: Field, AF: PrimeField>(
     constraints: &Vec<SymbolicExpression<ArkField<AF>>>,
     n_variables_in_polynomial: usize,
-) -> Vec<SparsePolynomial<AF, SparseTerm>> {
+) -> Result<Vec<SparsePolynomial<AF, SparseTerm>>, AirToCCSError> {
     let mut polys = Vec::<SparsePolynomial<AF, SparseTerm>>::with_capacity(constraints.len());
     for constraint in constraints {
-        let poly = expr_to_polynomial(constraint, n_variables_in_polynomial);
+        let poly = expr_to_polynomial(constraint, n_variables_in_polynomial)?;
         polys.push(poly);
     }
-    polys
+    Ok(polys)
 }
 
 /// Air polynomials come in two different forms: transition polynomials and boundary polynomials
 /// We do not support periodic constraints (i.e. polynomials applying to a subset of rows) since
-/// this may vary following the specific downstream SNARK used.
-/// `transition_polynomials` are used to check the correctness of rows AIR transitions, `boundary_polynomials`
+/// the way the CCS will be processed may vary following the specific downstream SNARK used.
+/// Roughly, `transition_polynomials` are used to check the correctness of rows AIR transitions, `boundary_polynomials`
 /// are used to check the correctness of public input values.
 /// `constant_polynomials` are similar to `boundary_polynomials` since they define constants
 /// against which trace values should be equal to.
@@ -251,13 +223,13 @@ pub struct AirPolynomials<F: PrimeField> {
 
 /// Given a set of AIR constraints, returns an `AirPolynomials` struct, containing both transition
 /// and boundary constraints. `n` is the number of rows in the air trace
-/// TODO: see how to support constant polynomials with transition constraints
+/// TODO: to support constant polynomials with transition constraints
 pub fn air_constraints_to_air_polynomials<F: PrimeField>(
     constraints: &Vec<SymbolicExpression<ArkField<F>>>,
     trace: &RowMajorMatrix<ArkField<F>>,
     n: usize,
     n_cols: usize,
-) -> AirPolynomials<F> {
+) -> Result<AirPolynomials<F>, AirToCCSError> {
     // We assume that boundary polynomials are of degree one, and we represent those
     // using a pair `(wtns_idx, value)`. This will later create the constraint that
     // a specific position in the `z` vector should equal `value`
@@ -266,23 +238,11 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
     let mut transition_polynomials = vec![];
 
     for constraint in constraints {
-        if let Some(((cell_col, cell_loc), constant)) = extract_public_constants(constraint) {
-            match cell_loc {
-                Location::FirstRow => {
-                    let trace_pos = cell_col;
-                    constant_polynomials.insert(trace_pos, constant.0);
-                }
-                Location::LastRow => {
-                    let trace_pos = n_cols * (n - 1) + cell_col;
-                    constant_polynomials.insert(trace_pos, constant.0);
-                }
-                Location::Transition => {
-                    panic!("Not supported yet");
-                }
-            };
-            continue;
-        }
-
+        // Extracting constants and extracting public values do not correspond to the same `if let`
+        // Extracting constants corresponds to extracting locations at which the trace should be
+        // equal to some specific pre-determined field element.
+        // Extracting public values corresponds to extracting locations at which the trace should
+        // be equal to some specific user-provided field element.
         if let Some(((cell_col, cell_loc), constant)) = extract_constants(constraint) {
             match cell_loc {
                 Location::FirstRow => {
@@ -294,7 +254,9 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
                     constant_polynomials.insert(trace_pos, constant.0);
                 }
                 Location::Transition => {
-                    panic!("Not supported yet");
+                    let msg = format!("Public constants in transition constraints are not supported. Found one at cell_loc: {}, cell_col: {}, public: {}",
+                            cell_loc, cell_loc, constant.0);
+                    return Err(AirToCCSError::NotSupported(msg));
                 }
             };
             continue;
@@ -313,24 +275,23 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
                     boundary_polynomials.insert(trace_pos, (value.0, Location::LastRow));
                 }
                 Location::Transition => {
-                    panic!(
-                            "[NOT SUPPORTED] Found a public value in a transition constraint, cell_loc: {}, cell_col: {}, public: {}",
-                            cell_loc, cell_loc, public
-                        );
+                    let msg = format!("Public values in transition constraints are not supported. Found one at cell_loc: {}, cell_col: {}, public: {}",
+                            cell_loc, cell_loc, public);
+                    return Err(AirToCCSError::NotSupported(msg.to_string()));
                 }
             };
             continue;
         } else {
-            let poly = expr_to_polynomial(constraint, n_cols * 2);
+            let poly = expr_to_polynomial(constraint, n_cols * 2)?;
             transition_polynomials.push(poly);
         }
     }
 
-    AirPolynomials {
+    Ok(AirPolynomials {
         transition_polynomials,
         boundary_polynomials,
         constant_polynomials,
-    }
+    })
 }
 
 /// `trace_idx_to_z_idx` maps a position in the trace to a position in the `z` vector.
@@ -405,8 +366,10 @@ pub struct AirCCSConstants {
 
 #[derive(Debug, Error)]
 pub enum AirToCCSError {
-    #[error("Incorrect length for public values. It should be of the same length as `number_of_cols * 2`. Got length: {0}")]
-    IncorrectPublicValuesLength(usize),
+    #[error("Index {0} does not exist in the AIR trace")]
+    InvalidAIRTraceIndex(usize),
+    #[error("{0}")]
+    NotSupported(String),
 }
 
 pub fn derive_ccs_constants<F: PrimeField>(
@@ -433,12 +396,11 @@ pub struct AirCCSMatrices<F: PrimeField> {
 }
 
 /// Builds the CCS matrices out of both boundary and transition constraints
-/// TODO: remove all `unwrap()` calls appearing below
 pub fn build_ccs_matrices<F: PrimeField>(
     ccs_constants: &AirCCSConstants,
     air_polynomials: &AirPolynomials<F>,
     z: &ZCCS<F>,
-) -> AirCCSMatrices<F> {
+) -> Result<AirCCSMatrices<F>, AirToCCSError> {
     let n_boundary_constraints = air_polynomials.boundary_polynomials.keys().len();
     let n_constants_constraints = air_polynomials.constant_polynomials.keys().len();
     let n_boundary_and_constants_constraints_rows =
@@ -456,13 +418,15 @@ pub fn build_ccs_matrices<F: PrimeField>(
         })
     }
 
-    // This is the first modification to lemma 3. Consists into adding boundary constraints.
-    // Assumes that there is a single boundary constraint per idx
-    // Assumes that boundary constraints are not applied to intermediary witness values
-    for (i, (trace_idx, (value, location))) in
-        air_polynomials.boundary_polynomials.iter().enumerate()
-    {
-        let z_idx = z.trace_idx_to_z_idx.get(&trace_idx).unwrap();
+    // This is a modification to lemma 3 from the CCS paper.
+    // We add here boundary constraints and assume that:
+    // 1. there is a single boundary constraint per idx
+    // 2. boundary constraints are not applied to intermediary witness values
+    for (i, (trace_idx, (value, _))) in air_polynomials.boundary_polynomials.iter().enumerate() {
+        let z_idx = z
+            .trace_idx_to_z_idx
+            .get(&trace_idx)
+            .ok_or(AirToCCSError::InvalidAIRTraceIndex(*trace_idx))?;
         let matrix_idx = i % ccs_constants.t;
         let row_idx = ccs_constants.m + i / ccs_constants.t;
         matrices[matrix_idx].coeffs[row_idx].push((F::one(), *z_idx));
@@ -475,26 +439,32 @@ pub fn build_ccs_matrices<F: PrimeField>(
     for i in 0..ccs_constants.m {
         for j in 0..ccs_constants.t {
             let trace_idx = i * ccs_constants.t / 2 + j;
-            let z_idx = z.trace_idx_to_z_idx.get(&trace_idx).unwrap();
+            let z_idx = z
+                .trace_idx_to_z_idx
+                .get(&trace_idx)
+                .ok_or(AirToCCSError::InvalidAIRTraceIndex(trace_idx))?;
             matrices[j].coeffs[i].push((F::one(), *z_idx));
             N += 1
         }
     }
 
-    // Add constant constraints
+    // This is a modification to lemma 3 from the CCS paper. We add here constant constraints.
     for (i, (trace_idx, value)) in air_polynomials.constant_polynomials.iter().enumerate() {
-        let z_idx = z.trace_idx_to_z_idx.get(trace_idx).unwrap();
+        let z_idx = z
+            .trace_idx_to_z_idx
+            .get(trace_idx)
+            .ok_or(AirToCCSError::InvalidAIRTraceIndex(*trace_idx))?;
         let matrix_idx = i % ccs_constants.t;
         let row_idx = ccs_constants.m + i / ccs_constants.t;
         matrices[matrix_idx].coeffs[row_idx].push((F::one(), *z_idx));
         matrices[matrix_idx].coeffs[row_idx].push((-*value, z.z.len() - 1));
     }
 
-    AirCCSMatrices {
+    Ok(AirCCSMatrices {
         matrices,
         N,
         n_boundary_and_constants_constraints_rows,
-    }
+    })
 }
 
 pub fn build_multisets_and_c_coefficients<F: PrimeField>(
@@ -563,11 +533,11 @@ pub mod tests {
         let num_variables_poly = num_cols * 2;
 
         let expr = SE::Sub(var_1, var_0_prime.clone());
-        let poly = expr_to_polynomial(&expr, num_variables_poly);
+        let poly = expr_to_polynomial(&expr, num_variables_poly).unwrap();
         check_expr_to_polynomial(&expr, poly, "(w1 - w0')", 4, 2, &eval_point, 8);
 
         let expr_2 = expr.clone() + expr.clone();
-        let poly = expr_to_polynomial(&expr_2, num_variables_poly);
+        let poly = expr_to_polynomial(&expr_2, num_variables_poly).unwrap();
         check_expr_to_polynomial(
             &expr_2,
             poly,
@@ -579,7 +549,7 @@ pub mod tests {
         );
 
         let expr_3 = expr_2.clone() * expr.clone();
-        let poly = expr_to_polynomial(&expr_3, num_variables_poly);
+        let poly = expr_to_polynomial(&expr_3, num_variables_poly).unwrap();
         check_expr_to_polynomial(
             &expr_3,
             poly,
@@ -592,7 +562,7 @@ pub mod tests {
 
         let expr_4 = SE::Add(var_1_prime, var_0_prime);
         let expr_5 = expr_3.clone() * expr_4;
-        let poly = expr_to_polynomial(&expr_5, num_variables_poly);
+        let poly = expr_to_polynomial(&expr_5, num_variables_poly).unwrap();
         check_expr_to_polynomial(
             &expr_5,
             poly,
@@ -604,7 +574,7 @@ pub mod tests {
         );
 
         let expr_zero = expr_5.clone() - expr_5.clone();
-        let poly = expr_to_polynomial(&expr_zero, num_variables_poly);
+        let poly = expr_to_polynomial(&expr_zero, num_variables_poly).unwrap();
         assert!(poly.is_zero());
     }
 }
