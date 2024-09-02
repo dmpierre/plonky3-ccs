@@ -39,7 +39,7 @@ pub struct SymbolicAirBuilder<F: Field> {
 }
 
 impl<F: Field> SymbolicAirBuilder<F> {
-    pub(crate) fn new(width: usize, num_public_values: usize) -> Self {
+    pub fn new(width: usize, num_public_values: usize) -> Self {
         let values = [false, true]
             .into_iter()
             .flat_map(|is_next| {

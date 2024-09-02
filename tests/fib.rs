@@ -96,7 +96,7 @@ pub struct FibonacciRow<F> {
 }
 
 impl<F> FibonacciRow<F> {
-    fn new(left: F, right: F) -> FibonacciRow<F> {
+    pub fn new(left: F, right: F) -> FibonacciRow<F> {
         FibonacciRow { left, right }
     }
 }

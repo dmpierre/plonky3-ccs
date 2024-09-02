@@ -31,6 +31,13 @@ pub mod tests {
             air_constraints_to_air_polynomials(&builder.constraints, &trace, n, trace.width)
                 .unwrap();
 
+        assert_eq!(
+            air_polynomials.constant_polynomials.len()
+                + air_polynomials.transition_polynomials.len()
+                + air_polynomials.boundary_polynomials.len(),
+            builder.constraints.len()
+        );
+
         let z_ccs = air_trace_to_z(&trace, &air_polynomials);
         let r = Fr::rand(&mut rng);
         let final_poly = air_transition_polynomials_to_unique_polynomial(&r, &air_polynomials);
