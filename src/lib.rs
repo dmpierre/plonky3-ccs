@@ -19,11 +19,11 @@ use p3_field::{Field, PrimeField as p3PrimeField};
 use p3_matrix::dense::RowMajorMatrix;
 use std::{collections::HashMap, hash::Hash, usize};
 pub use symbolic_builder::*;
-use symbolic_expression::{Location, SymbolicExpression};
+pub use symbolic_expression::{Location, SymbolicExpression};
 use thiserror::Error;
 use utils::naive_arkpoly_mul;
 
-use crate::symbolic_variable::{Public, Query, SymbolicVariable, Var};
+pub use crate::symbolic_variable::{Public, Query, SymbolicVariable, Var};
 
 pub fn extract_public_values<F: Field>(
     e: &SymbolicExpression<F>,
@@ -56,9 +56,16 @@ pub fn extract_public_values<F: Field>(
     Some(((cell_column, cell_location), public))
 }
 
+pub struct AirConstant<F: Field> {
+    pub column: usize,
+    pub location: Location,
+    pub value: F,
+    pub is_next: bool,
+}
+
 /// Constants against which a cell expression is asserted equal
 /// For instance constraints of the type: when_first_row.assert_zero(local.right);
-pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize, Location), F)> {
+pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<AirConstant<F>> {
     use SymbolicExpression as SE;
     use SymbolicVariable as SV;
     let (mul_lhs, mul_rhs) = match e {
@@ -74,40 +81,54 @@ pub fn extract_constants<F: Field>(e: &SymbolicExpression<F>) -> Option<((usize,
         // In this case, the constant is not public
         (
             SE::Location(location @ (Location::FirstRow | Location::LastRow)),
-            SE::Variable(SV(
-                Var::Query(Query {
-                    is_next: false,
-                    column,
-                }),
-                _,
-            )),
-        ) => return Some(((*column, *location), F::zero())),
+            SE::Variable(SV(Var::Query(Query { is_next, column }), _)),
+        ) => {
+            return Some(AirConstant {
+                column: *column,
+                location: *location,
+                value: F::zero(),
+                is_next: *is_next,
+            })
+        }
         // This match arm handles the assert_zero() constant constraint
         // In this case, the constant is public
         (
             SE::Location(location @ (Location::FirstRow | Location::LastRow)),
             SE::Variable(SV(Var::Public(p), _)),
-        ) => return Some(((p.index, *location), F::zero())),
-        _ => return None,
-    };
-    let (cell_column, constant) = match (sub_lhs, sub_rhs) {
-        (
-            SE::Variable(SV(
-                Var::Query(Query {
-                    is_next: false,
-                    column,
-                }),
-                _,
-            )),
-            SE::Constant(value),
-        ) => (*column, *value),
-        // This match arms handles public constants of any value, different from zero
-        (SE::Variable(SV(Var::Public(p), _)), SE::Constant(c)) => {
-            return Some(((p.index, cell_location), *c))
+        ) => {
+            return Some(AirConstant {
+                column: p.index,
+                location: *location,
+                value: F::zero(),
+                is_next: false,
+            })
         }
         _ => return None,
     };
-    Some(((cell_column, cell_location), constant))
+    let (cell_column, constant, is_next) = match (sub_lhs, sub_rhs) {
+        (SE::Variable(SV(Var::Query(Query { is_next, column }), _)), SE::Constant(value)) => {
+            (*column, *value, *is_next)
+        }
+        (SE::Constant(value), SE::Variable(SV(Var::Query(Query { is_next, column }), _))) => {
+            (*column, *value, *is_next)
+        }
+        // This match arms handles public constants of any value, different from zero
+        (SE::Variable(SV(Var::Public(p), _)), SE::Constant(c)) => {
+            return Some(AirConstant {
+                column: p.index,
+                location: cell_location,
+                value: *c,
+                is_next: false,
+            })
+        }
+        _ => return None,
+    };
+    Some(AirConstant {
+        column: cell_column,
+        location: cell_location,
+        value: constant,
+        is_next,
+    })
 }
 
 pub fn compile_circuit_cs<F, A>(
@@ -224,6 +245,7 @@ pub struct AirPolynomials<F: PrimeField> {
 /// Given a set of AIR constraints, returns an `AirPolynomials` struct, containing both transition
 /// and boundary constraints. `n` is the number of rows in the air trace
 /// TODO: to support constant polynomials with transition constraints
+/// TODO add checks on number of extracted polys vs number of constraints
 pub fn air_constraints_to_air_polynomials<F: PrimeField>(
     constraints: &Vec<SymbolicExpression<ArkField<F>>>,
     trace: &RowMajorMatrix<ArkField<F>>,
@@ -243,19 +265,19 @@ pub fn air_constraints_to_air_polynomials<F: PrimeField>(
         // equal to some specific pre-determined field element.
         // Extracting public values corresponds to extracting locations at which the trace should
         // be equal to some specific user-provided field element.
-        if let Some(((cell_col, cell_loc), constant)) = extract_constants(constraint) {
-            match cell_loc {
+        if let Some(constant) = extract_constants(constraint) {
+            match constant.location {
                 Location::FirstRow => {
-                    let trace_pos = cell_col;
-                    constant_polynomials.insert(trace_pos, constant.0);
+                    let trace_pos = constant.column;
+                    constant_polynomials.insert(trace_pos, constant.value.0);
                 }
                 Location::LastRow => {
-                    let trace_pos = n_cols * (n - 1) + cell_col;
-                    constant_polynomials.insert(trace_pos, constant.0);
+                    let trace_pos = n_cols * (n - 1) + constant.column;
+                    constant_polynomials.insert(trace_pos, constant.value.0);
                 }
                 Location::Transition => {
                     let msg = format!("Public constants in transition constraints are not supported. Found one at cell_loc: {}, cell_col: {}, public: {}",
-                            cell_loc, cell_loc, constant.0);
+                            constant.location, constant.column, constant.value.0);
                     return Err(AirToCCSError::NotSupported(msg));
                 }
             };
@@ -504,7 +526,7 @@ pub mod tests {
     use ark_bn254::Fr;
 
     use crate::{
-        arkfield::ArkField, expr_to_polynomial, SymbolicExpression as SE, SymbolicVariable as SA,
+        arkfield::ArkField, expr_to_polynomial, SymbolicExpression as SE, SymbolicVariable as SV,
     };
 
     pub(crate) fn check_expr_to_polynomial<F: PrimeField>(
@@ -524,9 +546,9 @@ pub mod tests {
 
     #[test]
     fn test_expr_to_polynomial() {
-        let var_1 = Rc::new(SE::Variable::<ArkField<Fr>>(SA::new_query(false, 1)));
-        let var_0_prime = Rc::new(SE::Variable(SA::new_query(true, 0)));
-        let var_1_prime = Rc::new(SE::Variable::<ArkField<Fr>>(SA::new_query(true, 1)));
+        let var_1 = Rc::new(SE::Variable::<ArkField<Fr>>(SV::new_query(false, 1)));
+        let var_0_prime = Rc::new(SE::Variable(SV::new_query(true, 0)));
+        let var_1_prime = Rc::new(SE::Variable::<ArkField<Fr>>(SV::new_query(true, 1)));
 
         let eval_point = &vec![Fr::from(2), Fr::from(10), Fr::from(2), Fr::from(10)];
         let num_cols = 2;
