@@ -6,10 +6,9 @@ mod tests {
     use crate::fib::FibonacciRow;
     use ark_bn254::Fr;
     use p3_air::AirBuilder;
-    use p3_field::Field;
     use plonky3_ccs::{arkfield::ArkField, SymbolicAirBuilder};
     use plonky3_ccs::{
-        extract_constants, AirConstant, Location, SymbolicExpression as SE, SymbolicVariable as SV,
+        extract_constants, AirConstant, SymbolicExpression as SE, SymbolicVariable as SV,
     };
     use std::u64;
 
@@ -23,7 +22,7 @@ mod tests {
         SE<ArkField<Fr>>,
         SE<ArkField<Fr>>,
     ) {
-        let mut builder = SymbolicAirBuilder::<ArkField<Fr>>::new(2, 0);
+        let builder = SymbolicAirBuilder::<ArkField<Fr>>::new(2, 0);
         let fib_row =
             FibonacciRow::new(ArkField(Fr::from(10 as u64)), ArkField(Fr::from(10 as u64)));
         let var = SE::Variable::<ArkField<Fr>>(SV::new_query(variable_is_next, variable_col));
@@ -47,8 +46,10 @@ mod tests {
         // extract non zero constant not next row, 1st column
         let (mut builder, row, var, constant) = initialize_builder_row_and_variable(false, 1, 2);
         let mut when_first_row = builder.when_first_row();
-        when_first_row.assert_zero(row.right);
+        let row = SE::Variable(SV::new_query(false, 0));
+        when_first_row.assert_zero(row);
         let zero_constant = extract_constants(&builder.constraints[0]);
+        check_air_constraint_to_constant(zero_constant, 0, 0);
     }
 
     #[test]
@@ -70,25 +71,18 @@ mod tests {
         when_first_row.assert_eq(var.clone(), row.right);
         let constant_left = extract_constants(&builder.constraints[0]);
         let constant_right = extract_constants(&builder.constraints[1]);
-
-        //check_air_constraint_to_constant(constant_left, 1, 2);
-        //check_air_constraint_to_constant(constant_right, 1, 2);
+        check_air_constraint_to_constant(constant_left, 1, 10);
+        check_air_constraint_to_constant(constant_right, 1, 10);
 
         // extract non zero constant not next row, 1st columwn, when_last_row
-        let (mut builder, row, var, constant) = initialize_builder_row_and_variable(false, 1, 3);
+        let (mut builder, row, var, constant) = initialize_builder_row_and_variable(false, 0, 3);
         let mut when_last_row = builder.when_last_row();
         when_last_row.assert_eq(row.right, var.clone());
         when_last_row.assert_eq(var.clone(), row.right);
         let constant_left = extract_constants(&builder.constraints[0]);
         let constant_right = extract_constants(&builder.constraints[1]);
-
-        // extract non zero constant next row, 1st column, when_last_row
-        let (mut builder, row, var, constant) = initialize_builder_row_and_variable(true, 1, 4);
-        let mut when_last_row = builder.when_last_row();
-        when_last_row.assert_eq(row.right, var.clone());
-        when_last_row.assert_eq(var.clone(), row.right);
-        let constant_left = extract_constants(&builder.constraints[0]);
-        let constant_right = extract_constants(&builder.constraints[1]);
+        check_air_constraint_to_constant(constant_left, 0, 10);
+        check_air_constraint_to_constant(constant_right, 0, 10);
     }
 
     #[test]
